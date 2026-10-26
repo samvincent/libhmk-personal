@@ -18,6 +18,32 @@
 #include "common.h"
 
 //--------------------------------------------------------------------+
+// Mouse keys configuration (compile-time, see MOUSE_KEYS.md)
+//--------------------------------------------------------------------+
+
+#ifndef MOUSEKEY_DELAY
+#define MOUSEKEY_DELAY 10 // ms before movement starts after a key press
+#endif
+#ifndef MOUSEKEY_INTERVAL
+#define MOUSEKEY_INTERVAL 20 // ms between movement steps
+#endif
+#ifndef MOUSEKEY_MOVE_DELTA
+#define MOUSEKEY_MOVE_DELTA 2 // base step size in counts
+#endif
+#ifndef MOUSEKEY_MAX_SPEED
+#define MOUSEKEY_MAX_SPEED 10 // maximum speed multiplier
+#endif
+#ifndef MOUSEKEY_TIME_TO_MAX
+#define MOUSEKEY_TIME_TO_MAX 40 // movement steps until maximum speed
+#endif
+#ifndef MOUSEKEY_WHEEL_DELAY
+#define MOUSEKEY_WHEEL_DELAY 10 // ms before scrolling starts after a key press
+#endif
+#ifndef MOUSEKEY_WHEEL_INTERVAL
+#define MOUSEKEY_WHEEL_INTERVAL 50 // ms between scroll steps
+#endif
+
+//--------------------------------------------------------------------+
 // HID API
 //--------------------------------------------------------------------+
 
@@ -54,3 +80,14 @@ void hid_keycode_remove(uint8_t keycode);
  * @return None
  */
 void hid_send_reports(void);
+
+/**
+ * @brief Update and send mouse movement reports
+ *
+ * Generates cursor and scroll deltas for the currently held mouse movement
+ * keycodes (SP_MOUSE_UP..SP_MOUSE_WHEEL_DOWN) and sends the mouse report if
+ * it changed. Call this once per main loop iteration.
+ *
+ * @return None
+ */
+void hid_mouse_task(void);

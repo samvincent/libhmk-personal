@@ -16,10 +16,28 @@
 #include "hid.h"
 
 #include "commands.h"
+#include "hardware/hardware.h"
 #include "keycodes.h"
 #include "matrix.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
+
+/**
+ * @brief Add a movement delta to a signed 8-bit axis, clamping to the HID range
+ *
+ * @param current Current axis value
+ * @param delta Delta to add
+ *
+ * @return New clamped axis value
+ */
+static int8_t hid_mouse_axis_add(int8_t current, int16_t delta) {
+  int16_t value = current + delta;
+  if (value > 127)
+    value = 127;
+  else if (value < -127)
+    value = -127;
+  return (int8_t)value;
+}
 
 // Track how many keys are currently in the 6KRO part of the report
 static uint8_t num_6kro_keys;
@@ -28,6 +46,19 @@ static hid_nkro_kb_report_t kb_report;
 static uint16_t system_report;
 static uint16_t consumer_report;
 static hid_mouse_report_t mouse_report;
+
+// Mouse movement / scroll key state (experimental, see MOUSE_KEYS.md)
+// Bit layout for both masks: 0 = up, 1 = down, 2 = left, 3 = right
+static uint8_t mouse_move_state;
+static uint8_t mouse_wheel_state;
+static uint32_t mouse_last_tick;
+static uint32_t mouse_move_start;
+static uint32_t mouse_wheel_start;
+static uint32_t mouse_move_steps;
+static uint16_t mouse_move_accumulator;
+static uint16_t mouse_wheel_accumulator;
+static bool mouse_moving;
+static bool mouse_scrolling;
 
 #if !defined(HID_DISABLED)
 /**
@@ -101,6 +132,21 @@ static void hid_send_hid_report(uint8_t starting_report_id) {
 void hid_init(void) {}
 
 void hid_keycode_add(uint8_t keycode) {
+  switch (keycode) {
+  case MOUSE_MOVE_KEYCODE_RANGE: {
+    // Movement and scroll keycodes have no HID code; they are polled by
+    // hid_mouse_task() instead
+    const uint8_t bit = 1 << (keycode - SP_MOUSE_UP);
+    if (keycode <= SP_MOUSE_RIGHT)
+      mouse_move_state |= bit;
+    else
+      mouse_wheel_state |= bit;
+    return;
+  }
+  default:
+    break;
+  }
+
   const uint16_t hid_code = keycode_to_hid[keycode];
 
   if (!hid_code)
@@ -151,6 +197,19 @@ void hid_keycode_add(uint8_t keycode) {
 }
 
 void hid_keycode_remove(uint8_t keycode) {
+  switch (keycode) {
+  case MOUSE_MOVE_KEYCODE_RANGE: {
+    const uint8_t bit = 1 << (keycode - SP_MOUSE_UP);
+    if (keycode <= SP_MOUSE_RIGHT)
+      mouse_move_state &= ~bit;
+    else
+      mouse_wheel_state &= ~bit;
+    return;
+  }
+  default:
+    break;
+  }
+
   const uint16_t hid_code = keycode_to_hid[keycode];
 
   if (!hid_code)
@@ -193,6 +252,91 @@ void hid_keycode_remove(uint8_t keycode) {
   default:
     break;
   }
+}
+
+void hid_mouse_task(void) {
+#if !defined(HID_DISABLED)
+  static hid_mouse_report_t prev_mouse_task_report = {0};
+  const bool move_active = mouse_move_state != 0;
+  const bool wheel_active = mouse_wheel_state != 0;
+
+  if (!move_active && !mouse_moving && !wheel_active && !mouse_scrolling)
+    // Nothing is held and the report already reflects the idle state
+    return;
+
+  const uint32_t now = timer_read();
+  uint32_t dt = timer_elapsed(mouse_last_tick);
+  mouse_last_tick = now;
+  // Clamp dt so that a long gap (e.g. right after boot) cannot burst steps
+  if (dt > 100)
+    dt = 100;
+
+  if (move_active) {
+    if (!mouse_moving) {
+      // Start of a new movement: reset the acceleration state
+      mouse_moving = true;
+      mouse_move_start = now;
+      mouse_move_steps = 0;
+      mouse_move_accumulator = 0;
+    }
+    if (timer_elapsed(mouse_move_start) >= MOUSEKEY_DELAY) {
+      mouse_move_accumulator += dt;
+      while (mouse_move_accumulator >= MOUSEKEY_INTERVAL) {
+        mouse_move_accumulator -= MOUSEKEY_INTERVAL;
+        // Accelerate linearly from 1x to MOUSEKEY_MAX_SPEED
+        uint16_t extra = mouse_move_steps / MOUSEKEY_TIME_TO_MAX;
+        if (extra > MOUSEKEY_MAX_SPEED - 1)
+          extra = MOUSEKEY_MAX_SPEED - 1;
+        const int16_t step = MOUSEKEY_MOVE_DELTA * (1 + extra);
+        // Bit layout: 0 = up, 1 = down, 2 = left, 3 = right (HID y is
+        // positive downwards)
+        if (mouse_move_state & 0x01)
+          mouse_report.y = hid_mouse_axis_add(mouse_report.y, -step);
+        if (mouse_move_state & 0x02)
+          mouse_report.y = hid_mouse_axis_add(mouse_report.y, step);
+        if (mouse_move_state & 0x04)
+          mouse_report.x = hid_mouse_axis_add(mouse_report.x, -step);
+        if (mouse_move_state & 0x08)
+          mouse_report.x = hid_mouse_axis_add(mouse_report.x, step);
+        mouse_move_steps++;
+      }
+    }
+  } else if (mouse_moving) {
+    // Movement stopped: zero the axes once so the host sees the stop
+    mouse_moving = false;
+    mouse_report.x = 0;
+    mouse_report.y = 0;
+  }
+
+  if (wheel_active) {
+    if (!mouse_scrolling) {
+      mouse_scrolling = true;
+      mouse_wheel_accumulator = 0;
+      mouse_wheel_start = now;
+    }
+    if (timer_elapsed(mouse_wheel_start) >= MOUSEKEY_WHEEL_DELAY) {
+      mouse_wheel_accumulator += dt;
+      while (mouse_wheel_accumulator >= MOUSEKEY_WHEEL_INTERVAL) {
+        mouse_wheel_accumulator -= MOUSEKEY_WHEEL_INTERVAL;
+        // Bit layout: 0 = up, 1 = down. The default mouse descriptor has no
+        // horizontal wheel, so left/right scroll is not implemented.
+        if (mouse_wheel_state & 0x01)
+          mouse_report.wheel--;
+        if (mouse_wheel_state & 0x02)
+          mouse_report.wheel++;
+      }
+    }
+  } else if (mouse_scrolling) {
+    mouse_scrolling = false;
+    mouse_report.wheel = 0;
+  }
+
+  if (memcmp(&mouse_report, &prev_mouse_task_report, sizeof(mouse_report)) !=
+      0) {
+    prev_mouse_task_report = mouse_report;
+    hid_send_reports();
+  }
+#endif
 }
 
 void hid_send_reports(void) {

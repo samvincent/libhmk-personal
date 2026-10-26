@@ -56,6 +56,7 @@ int main(void) {
     analog_task();
     matrix_scan();
     layout_task();
+    hid_mouse_task();
     xinput_task();
   }
 
